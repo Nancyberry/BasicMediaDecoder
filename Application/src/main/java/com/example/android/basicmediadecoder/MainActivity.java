@@ -18,11 +18,15 @@ package com.example.android.basicmediadecoder;
 
 
 import android.animation.TimeAnimator;
+import android.annotation.TargetApi;
 import android.app.Activity;
 import android.media.MediaCodec;
 import android.media.MediaExtractor;
+import android.media.MediaFormat;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
@@ -34,12 +38,14 @@ import android.widget.TextView;
 import com.example.android.common.media.MediaCodecWrapper;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 
 /**
  * This activity uses a {@link android.view.TextureView} to render the frames of a video decoded using
  * {@link android.media.MediaCodec} API.
  */
 public class MainActivity extends Activity {
+    private final String TAG = "MainActivity";
 
     private TextureView mPlaybackView;
     private TimeAnimator mTimeAnimator = new TimeAnimator();
@@ -50,6 +56,8 @@ public class MainActivity extends Activity {
     private MediaExtractor mExtractor = new MediaExtractor();
     TextView mAttribView = null;
 
+    // for simple codec logic
+    private MediaCodec mMediaCodec = null;
 
     /**
      * Called when the activity is first created.
@@ -59,7 +67,7 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.sample_main);
         mPlaybackView = (TextureView) findViewById(R.id.PlaybackView);
-        mAttribView =  (TextView)findViewById(R.id.AttribView);
+        mAttribView = (TextView) findViewById(R.id.AttribView);
 
     }
 
@@ -73,12 +81,18 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        if(mTimeAnimator != null && mTimeAnimator.isRunning()) {
+        if (mTimeAnimator != null && mTimeAnimator.isRunning()) {
             mTimeAnimator.end();
         }
 
-        if (mCodecWrapper != null ) {
+        if (mCodecWrapper != null) {
             mCodecWrapper.stopAndRelease();
+            mExtractor.release();
+        }
+
+        if (mMediaCodec != null) {
+            mMediaCodec.stop();
+            mMediaCodec.release();
             mExtractor.release();
         }
     }
@@ -93,7 +107,17 @@ public class MainActivity extends Activity {
         return true;
     }
 
+    public void stopPlayback() {
+        mTimeAnimator.end();
 
+        if (mMediaCodec != null) {
+            mMediaCodec.stop();
+            mMediaCodec.release();
+            mExtractor.release();
+        }
+    }
+
+    @TargetApi(21)
     public void startPlayback() {
 
         // Construct a URI that points to the video resource that we want to play
@@ -121,16 +145,91 @@ public class MainActivity extends Activity {
                 // Try to create a video codec for this track. This call will return null if the
                 // track is not a video track, or not a recognized video format. Once it returns
                 // a valid MediaCodecWrapper, we can break out of the loop.
-                mCodecWrapper = MediaCodecWrapper.fromVideoFormat(mExtractor.getTrackFormat(i),
-                        new Surface(mPlaybackView.getSurfaceTexture()));
-                if (mCodecWrapper != null) {
+
+//                // START (Solution 1: decode sync deprecated (using ByteBuffer array))
+//                mCodecWrapper = MediaCodecWrapper.fromVideoFormat(mExtractor.getTrackFormat(i),
+//                        new Surface(mPlaybackView.getSurfaceTexture()));
+//                // END (Solution 1: decode sync deprecated (using ByteBuffer array))
+
+//                // START (Solution 2: decode sync)
+                String mimeType = mExtractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME);
+                if (mimeType.contains("video")) {    // create, configure and start codec
+                    mMediaCodec = MediaCodec.createDecoderByType(mimeType);
+                    mMediaCodec.configure(mExtractor.getTrackFormat(i), new Surface(mPlaybackView.getSurfaceTexture()), null, 0);
+                    mMediaCodec.start();
+                }
+                // END (Solution 2: decode sync)
+
+/*
+                // START (Solution 3: decode async)
+                // BUT not using TimeAnimator makes decoding too fast
+                String mimeType = mExtractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME);
+                if (mimeType.contains("video")) {
+                    mMediaCodec = MediaCodec.createDecoderByType(mimeType);
+                    mMediaCodec.setCallback(new MediaCodec.Callback() {
+                        @Override
+                        public void onInputBufferAvailable(MediaCodec mediaCodec, int inputBufferId) {
+
+                            ByteBuffer inputBuffer = getInputBuffer(inputBufferId);
+                            int size = mExtractor.readSampleData(inputBuffer, inputBufferId);
+
+                            if (size > 0) {
+                                mediaCodec.queueInputBuffer(inputBufferId, 0, size, mExtractor.getSampleTime(), mExtractor.getSampleFlags());
+                            } else {    // EOS
+                                mediaCodec.queueInputBuffer(inputBufferId, 0, 0, 0, mExtractor.getSampleFlags() | MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                            }
+
+                            mExtractor.advance();
+                        }
+
+                        @Override
+                        public void onOutputBufferAvailable(MediaCodec mediaCodec, int outputBufferId, MediaCodec.BufferInfo bufferInfo) {
+
+                            switch (outputBufferId) {
+                                case MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:
+                                    Log.d(TAG, "INFO_OUTPUT_FORMAT_CHANGED format : " + mMediaCodec.getOutputFormat());
+                                    break;
+                                case MediaCodec.INFO_TRY_AGAIN_LATER:
+                                    Log.d(TAG, "INFO_TRY_AGAIN_LATER");
+                                    break;
+                                case MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED:
+                                    Log.d(TAG, "INFO_OUTPUT_BUFFERS_CHANGED");
+                                    break;
+                                default:
+                                    mMediaCodec.releaseOutputBuffer(outputBufferId, true);
+                                    Log.d(TAG, "Render");
+                                    break;
+                            }
+
+                            if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {   // EOS
+                                Log.d(TAG, "OutputBuffer BUFFER_FLAG_END_OF_STREAM");
+                                stopPlayback();
+                            }
+                        }
+
+                        @Override
+                        public void onError(MediaCodec mediaCodec, MediaCodec.CodecException e) {
+                            e.printStackTrace();
+                        }
+
+                        @Override
+                        public void onOutputFormatChanged(MediaCodec mediaCodec, MediaFormat mediaFormat) {
+
+                        }
+                    });
+
+                    mMediaCodec.configure(mExtractor.getTrackFormat(i), new Surface(mPlaybackView.getSurfaceTexture()), null, 0);
+                    mMediaCodec.start();
+                }
+                // END (Solution 3: decode async)
+*/
+
+                if (mCodecWrapper != null || mMediaCodec != null) {
                     mExtractor.selectTrack(i);
                     break;
                 }
             }
             // END_INCLUDE(initialize_extractor)
-
-
 
 
             // By using a {@link TimeAnimator}, we can sync our media rendering commands with
@@ -141,41 +240,10 @@ public class MainActivity extends Activity {
                 public void onTimeUpdate(final TimeAnimator animation,
                                          final long totalTime,
                                          final long deltaTime) {
-
-                    boolean isEos = ((mExtractor.getSampleFlags() & MediaCodec
-                            .BUFFER_FLAG_END_OF_STREAM) == MediaCodec.BUFFER_FLAG_END_OF_STREAM);
-
-                    // BEGIN_INCLUDE(write_sample)
-                    if (!isEos) {
-                        // Try to submit the sample to the codec and if successful advance the
-                        // extractor to the next available sample to read.
-                        boolean result = mCodecWrapper.writeSample(mExtractor, false,
-                                mExtractor.getSampleTime(), mExtractor.getSampleFlags());
-
-                        if (result) {
-                            // Advancing the extractor is a blocking operation and it MUST be
-                            // executed outside the main thread in real applications.
-                            mExtractor.advance();
-                        }
-                    }
-                    // END_INCLUDE(write_sample)
-
-                    // Examine the sample at the head of the queue to see if its ready to be
-                    // rendered and is not zero sized End-of-Stream record.
-                    MediaCodec.BufferInfo out_bufferInfo = new MediaCodec.BufferInfo();
-                    mCodecWrapper.peekSample(out_bufferInfo);
-
-                    // BEGIN_INCLUDE(render_sample)
-                    if (out_bufferInfo.size <= 0 && isEos) {
-                        mTimeAnimator.end();
-                        mCodecWrapper.stopAndRelease();
-                        mExtractor.release();
-                    } else if (out_bufferInfo.presentationTimeUs / 1000 < totalTime) {
-                        // Pop the sample off the queue and send it to {@link Surface}
-                        mCodecWrapper.popSample(true);
-                    }
-                    // END_INCLUDE(render_sample)
-
+                    // Switch decoding solution here
+                    decode();
+//                    decodeDeprecated(totalTime);
+//                    decodeAsync();
                 }
             });
 
@@ -184,6 +252,130 @@ public class MainActivity extends Activity {
             mTimeAnimator.start();
         } catch (IOException e) {
             e.printStackTrace();
+        }
+    }
+
+    /**
+     * Solution 1: Synchronous Processing using Buffer Arrays (deprecated)
+     * But it's using to Queues to record current available input/output buffer indexes, which is interesting.
+     *
+     * @param totalTime
+     */
+    private void decodeDeprecated(long totalTime) {
+        boolean isEos = ((mExtractor.getSampleFlags() & MediaCodec
+                .BUFFER_FLAG_END_OF_STREAM) == MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+
+        // BEGIN_INCLUDE(write_sample)
+        if (!isEos) {
+            // Try to submit the sample to the codec and if successful advance the
+            // extractor to the next available sample to read.
+            boolean result = mCodecWrapper.writeSample(mExtractor, false,
+                    mExtractor.getSampleTime(), mExtractor.getSampleFlags());
+
+            if (result) {
+                // Advancing the extractor is a blocking operation and it MUST be
+                // executed outside the main thread in real applications.
+                mExtractor.advance();
+            }
+        }
+        // END_INCLUDE(write_sample)
+
+        // Examine the sample at the head of the queue to see if its ready to be
+        // rendered and is not zero sized End-of-Stream record.
+        MediaCodec.BufferInfo out_bufferInfo = new MediaCodec.BufferInfo();
+        mCodecWrapper.peekSample(out_bufferInfo);
+
+        // BEGIN_INCLUDE(render_sample)
+        if (out_bufferInfo.size <= 0 && isEos) {
+            mTimeAnimator.end();
+            mCodecWrapper.stopAndRelease();
+            mExtractor.release();
+        } else if (out_bufferInfo.presentationTimeUs / 1000 < totalTime) {
+            // Pop the sample off the queue and send it to {@link Surface}
+            mCodecWrapper.popSample(true);
+        }
+        // END_INCLUDE(render_sample)
+    }
+
+    /**
+     * Solution 2: Synchronous Processing using Buffers
+     */
+    private void decode() {
+        // producer
+        int inputBufferId = mMediaCodec.dequeueInputBuffer(0);
+        if (inputBufferId >= 0) {   // if valid input buffer, feed it with valid data
+            ByteBuffer inputBuffer = getInputBuffer(inputBufferId);
+            int flags = mExtractor.getSampleFlags();
+            int size = mExtractor.readSampleData(inputBuffer, 0);
+
+            if (size > 0) {     // advance extractor to the next sample
+                mMediaCodec.queueInputBuffer(inputBufferId, 0, size, mExtractor.getSampleTime(), flags);
+            } else {    // EOS, note that size and sample time will all be -1
+                Log.d(TAG, "InputBuffer BUFFER_FLAG_END_OF_STREAM. size = " + size + ", sample time = " + mExtractor.getSampleTime());
+                mMediaCodec.queueInputBuffer(inputBufferId, 0, 0, 0, flags | MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+            }
+
+            mExtractor.advance();
+        }
+
+        // consumer
+        MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+        int outputBufferId = mMediaCodec.dequeueOutputBuffer(bufferInfo, 0);
+
+        switch (outputBufferId) {
+            case MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:
+                Log.d(TAG, "INFO_OUTPUT_FORMAT_CHANGED format : " + mMediaCodec.getOutputFormat());
+                break;
+            case MediaCodec.INFO_TRY_AGAIN_LATER:
+                Log.d(TAG, "INFO_TRY_AGAIN_LATER");
+                break;
+            case MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED:
+                Log.d(TAG, "INFO_OUTPUT_BUFFERS_CHANGED");
+                break;
+            default:
+                mMediaCodec.releaseOutputBuffer(outputBufferId, true);
+                Log.d(TAG, "Render");
+                break;
+        }
+
+        if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {   // EOS
+            Log.d(TAG, "OutputBuffer BUFFER_FLAG_END_OF_STREAM");
+            stopPlayback();
+        }
+    }
+
+    /**
+     * TODO Solution 3: Asynchronous processing using callback (recommended)
+     * Currently it is done when the MediaCodec is initialized, with some flaws
+     */
+    private void decodeAsync() {
+
+    }
+
+
+    /**
+     * Back compatible with getInputBuffers
+     * @param index
+     * @return
+     */
+    private ByteBuffer getInputBuffer(int index) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+            return mMediaCodec.getInputBuffers()[index];
+        } else {
+            return mMediaCodec.getInputBuffer(index);
+        }
+    }
+
+    /**
+     * Back compatible with getOutputBuffers
+     * @param index
+     * @return
+     */
+    private ByteBuffer getOutputBuffer(int index) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+            return mMediaCodec.getOutputBuffers()[index];
+        } else {
+            return mMediaCodec.getOutputBuffer(index);
         }
     }
 }
